@@ -182,164 +182,194 @@ def get_required_arguments_info(operator) -> list:
     return args
 
 
-def print_condition(print_mode: str) -> str:
-    output_string = ", "
-    if print_mode == "Extension":
-        output_string += "allOf"
-    if print_mode == "Profile":
-        output_string += "anyOf"
-    return output_string
+class _PoolBuilder:
+    def __init__(self):
+        self.items = []
+        self.slice_map = {}
+
+    def add_slice(self, seq: tuple) -> tuple[int, int]:
+        if not seq:
+            return (0, 0)
+        if seq in self.slice_map:
+            return self.slice_map[seq]
+        offset = len(self.items)
+        self.items.extend(seq)
+        res = (offset, len(seq))
+        self.slice_map[seq] = res
+        return res
 
 
-def print_profile(profiles: list) -> str:
-    # Start of the profile/extension set, e.g. {{Profile...
-    output_string = "    {{"
-
-    for prof in profiles:
-        output_string += convert_to_export_format_profile(prof)
-
-        if not prof == profiles[-1]:
-            output_string += ", "
-
-    # End of the profile/extension set, e.g. ...pro_fp}, {
-    output_string += "}, "
-
-    return output_string
+def get_condition(print_mode: str, num_profiles: int) -> str:
+    if num_profiles > 1 and print_mode == "Extension":
+        return "CheckCondition::allOf"
+    return "CheckCondition::anyOf"
 
 
-"""
-  Dictionary of argument_compliances looks like:
-    1: {'in_t': 'fp16_t', 'out_t': 'i32_t'}
-    2: {'in_t': 'fp32_t', 'out_t': 'i32_t'}
-"""
-
-
-def print_argument_compliances(args: TOSAOperatorArgument, compliances: list) -> str:
-    output_string = "{"
-    for i, (compl, version_added) in enumerate(compliances):
-        # Start of the argument set
-        output_string += "{{"
-
+def build_argument_compliances(
+    args: TOSAOperatorArgument, compliances: list
+) -> tuple[tuple[tuple[str, ...], str], ...]:
+    vti_list = []
+    for compl, version_added in compliances:
+        types = []
         for arg in args:
             sym_ty = arg.tensor_element_type
 
             # Transform enumerated type to symbolic type.
             if sym_ty == "-":
-                if not arg.type == "acc_type_t":
+                if arg.type != "acc_type_t":
                     raise RuntimeError(
                         f"Type {arg.type} is not considered in the validation"
                     )
                 sym_ty = "acc_t"
 
-            if sym_ty in compl.keys():
+            if sym_ty in compl:
                 concrete_ty = compl[sym_ty]
-                output_string += convert_to_export_format_type(concrete_ty)
+                types.append(convert_to_export_format_type(concrete_ty))
 
-                if not arg == args[-1]:
-                    output_string += ", "
-
-        # End of the argument set
-        output_string += "}"
-
-        # Add version added information
         version_major, version_minor = version_added.split(".")
         version_string = f"SpecificationVersion::V_{version_major}_{version_minor}"
-        output_string += f", {version_string}}}"
+        vti_list.append((tuple(types), version_string))
 
-        if i != len(compliances) - 1:
-            output_string += ", "
-
-    output_string += "}"
-
-    return output_string
+    return tuple(vti_list)
 
 
-"""
-Desired output format looks like:
-    {"tosa.depthwise_conv2d",
-      {
-        {{Profile::pro_int}, {{i8T, i8T, i32T, i32T}}},
-        {{Profile::pro_fp},
-         {{fp16T, fp16T, fp16T, fp16T},
-          {fp16T, fp16T, fp16T, fp32T},
-          {fp32T, fp32T, fp32T, fp32T}}}
-      }
-    },
-"""
-
-
-def print_operator(
-    name: str, args: TOSAOperatorArgument, depot: dict, print_mode: str, file
-) -> str:
-    output_string = '{"'
-    output_string += convert_to_export_format_op(name)
-    # Start of the whole set of the tuple of (profile, compliances set).
-    output_string += '",\n  {\n'
-
-    cnt = 0
-    # `profiles` can be a single profile or extension, or a set of combination
-    # of profile and extension, e.g. {PRO-INT, PRO-FP}, {EXT-BF16 and EXT-FP8E4M3FN},
-    # and {PRO-INT and EXT-VARIABLE}.
-    for profiles, argument_compliances in depot.items():
-        delimiter = " "
-        # Filter out the delimiter word.
-        post_profiles = profiles.split(delimiter)
-
-        output_string += print_profile(post_profiles)
-
-        output_string += print_argument_compliances(args, argument_compliances)
-
-        if len(post_profiles) > 1:
-            output_string += print_condition(print_mode)
-
-        # End of each tuple of (profile, compliances set, condition).
-        output_string += "}"
-
-        cnt += 1
-        if cnt < len(depot):
-            output_string += ","
-
-        output_string += "\n"
-
-    # End of the whole set of the tuple of (profile, compliances set).
-    output_string += "  }\n},\n"
-
-    if cnt != 0:
-        file.write(output_string)
-
-
-# Generate output for the validation pass in MLIR
-def export_operator(operator: TOSAOperator, file, print_mode: str) -> None:
+def build_operator_entries(
+    operator: TOSAOperator, print_mode: str
+) -> tuple[str, tuple] | None:
     args = get_required_arguments_info(operator)
+    depot = get_profile_compliance_info(operator, args, print_mode)
+    if len(depot) == 0:
+        return None
 
-    """
-    The layout of the `profile_compliance_depot` dictionary:
-      {'profile_a, ...' : [ {sym_ty_a: param_ty_a, sym_ty_b: param_ty_b, ...},
-                            {sym_ty_a: param_ty_c, sym_ty_b: param_ty_d, ...} ],
-       'profile_b, ...' : [ {sym_ty_a: param_ty_a, sym_ty_b: param_ty_a, ...},
-                            {sym_ty_a: param_ty_e, sym_ty_b: param_ty_f, ...} ],
-       ...
-      }
-    """
-    profile_compliance_depot = get_profile_compliance_info(operator, args, print_mode)
+    infos = []
+    for profiles, argument_compliances in depot.items():
+        post_profiles = profiles.split(" ")
+        modes = tuple(convert_to_export_format_profile(p) for p in post_profiles)
+        vtis = build_argument_compliances(args, argument_compliances)
+        cond = get_condition(print_mode, len(post_profiles))
+        infos.append((modes, vtis, cond))
 
-    # No profile compliance information found.
-    if len(profile_compliance_depot) == 0:
-        return
+    return (convert_to_export_format_op(operator.name), tuple(infos))
 
-    print_operator(operator.name, args, profile_compliance_depot, print_mode, file)
+
+def collect_compliance_entries(spec, print_mode: str) -> list[tuple[str, tuple]]:
+    entries = []
+    for group in spec.operatorgroups:
+        for op in group.operators:
+            entry = build_operator_entries(op, print_mode)
+            if entry is not None:
+                entries.append(entry)
+    return sorted(entries, key=lambda x: x[0])
 
 
 def print_profiles_extensions(spec, outdir):
-    with open(os.path.join(outdir, "compliance.meta"), "w") as f:
-        f.write("profileComplianceMap = {\n")
-        for group in spec.operatorgroups:
-            for op in group.operators:
-                export_operator(op, f, "Profile")
-        f.write("};\n\n")
+    prof_entries = collect_compliance_entries(spec, "Profile")
+    ext_entries = collect_compliance_entries(spec, "Extension")
 
-        f.write("extensionComplianceMap = {\n")
-        for group in spec.operatorgroups:
-            for op in group.operators:
-                export_operator(op, f, "Extension")
-        f.write("};\n")
+    type_pool = _PoolBuilder()
+    vti_pool = _PoolBuilder()
+    prof_mode_pool = _PoolBuilder()
+    ext_mode_pool = _PoolBuilder()
+
+    def build_info_table(entries, mode_pool, mode_array_name):
+        info_rows = []
+        op_rows = []
+        for op_name, infos in entries:
+            info_start = len(info_rows)
+            for modes, vtis, cond in infos:
+                m_off, m_len = mode_pool.add_slice(modes)
+                vti_objs = []
+                for types, version in vtis:
+                    t_off, t_len = type_pool.add_slice(types)
+                    vti_objs.append((t_off, t_len, version))
+                v_off, v_len = vti_pool.add_slice(tuple(vti_objs))
+                info_rows.append((m_off, m_len, v_off, v_len, cond, mode_array_name))
+            op_rows.append((op_name, info_start, len(infos)))
+        return info_rows, op_rows
+
+    prof_info_rows, prof_op_rows = build_info_table(
+        prof_entries, prof_mode_pool, "kProfileModes"
+    )
+    ext_info_rows, ext_op_rows = build_info_table(
+        ext_entries, ext_mode_pool, "kExtensionModes"
+    )
+
+    lines = [
+        "// The profile-based compliance content below is auto-generated by the script",
+        "// `tools/genspec.py` in https://github.com/arm/tosa-specification",
+        "",
+        "static constexpr TypeInfo kComplianceTypeInfos[] = {",
+    ]
+    for i in range(0, len(type_pool.items), 8):
+        chunk = ", ".join(type_pool.items[i : i + 8])
+        lines.append(f"    {chunk},")
+    lines.extend(["};", ""])
+
+    lines.append("static constexpr VersionedTypeInfo kVersionedTypeInfos[] = {")
+    for t_off, t_len, version in vti_pool.items:
+        lines.append(
+            f"    {{llvm::ArrayRef(&kComplianceTypeInfos[{t_off}], {t_len}),"
+            f" {version}}},"
+        )
+    lines.extend(["};", ""])
+
+    lines.append("static constexpr Profile kProfileModes[] = {")
+    for i in range(0, len(prof_mode_pool.items), 4):
+        chunk = ", ".join(prof_mode_pool.items[i : i + 4])
+        lines.append(f"    {chunk},")
+    lines.extend(["};", ""])
+
+    lines.append("static constexpr Extension kExtensionModes[] = {")
+    for i in range(0, len(ext_mode_pool.items), 4):
+        chunk = ", ".join(ext_mode_pool.items[i : i + 4])
+        lines.append(f"    {chunk},")
+    lines.extend(["};", ""])
+
+    def emit_info_array(type_param, array_name, rows):
+        lines.append(
+            f"static constexpr OpComplianceInfo<{type_param}> {array_name}[] = {{"
+        )
+        for m_off, m_len, v_off, v_len, cond, mode_arr in rows:
+            mode_ref = f"llvm::ArrayRef(&{mode_arr}[{m_off}], {m_len})"
+            vti_ref = (
+                f"llvm::ArrayRef(&kVersionedTypeInfos[{v_off}], {v_len})"
+                if v_len > 0
+                else "{}"
+            )
+            if cond == "CheckCondition::anyOf":
+                lines.append(f"    {{{mode_ref}, {vti_ref}}},")
+            else:
+                lines.append(f"    {{{mode_ref}, {vti_ref}, {cond}}},")
+        lines.extend(["};", ""])
+
+    emit_info_array("Profile", "kProfileComplianceInfos", prof_info_rows)
+    emit_info_array("Extension", "kExtensionComplianceInfos", ext_info_rows)
+
+    def emit_op_table(type_param, table_name, info_array_name, op_rows):
+        lines.append(
+            f"static constexpr OpComplianceEntry<{type_param}> {table_name}[] = {{"
+        )
+        for op_name, i_off, i_len in op_rows:
+            lines.append(
+                f'    {{"{op_name}",'
+                f" llvm::ArrayRef(&{info_array_name}[{i_off}], {i_len})}},"
+            )
+        lines.extend(["};", ""])
+
+    emit_op_table(
+        "Profile",
+        "kProfileComplianceTable",
+        "kProfileComplianceInfos",
+        prof_op_rows,
+    )
+    emit_op_table(
+        "Extension",
+        "kExtensionComplianceTable",
+        "kExtensionComplianceInfos",
+        ext_op_rows,
+    )
+    lines.append("// End of auto-generated metadata")
+    lines.append("")
+
+    with open(os.path.join(outdir, "compliance.meta"), "w") as f:
+        f.write("\n".join(lines))
