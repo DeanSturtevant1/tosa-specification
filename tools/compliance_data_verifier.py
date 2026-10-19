@@ -204,20 +204,14 @@ def split_top_level_braced_rows(body: str) -> list[str]:
     return rows
 
 
-def parse_array_ref(expr: str, expected_array: str, total_len: int) -> tuple[int, int]:
-    match = re.fullmatch(
-        rf"llvm::ArrayRef\(&{re.escape(expected_array)}\[(\d+)\],\s*(\d+)\)",
-        expr.strip(),
-    )
-    if not match:
-        raise RuntimeError(f"invalid ArrayRef expression: {expr}")
-    offset = int(match.group(1))
-    length = int(match.group(2))
-    if length <= 0 or offset < 0 or offset + length > total_len:
-        raise RuntimeError(
-            f"out-of-bounds ArrayRef into {expected_array}: [{offset}, +{length})"
-        )
-    return offset, length
+def parse_braced_list(expr: str) -> list[str]:
+    expr = expr.strip()
+    if not (expr.startswith("{") and expr.endswith("}")):
+        raise RuntimeError(f"syntax error: expected braced list, got {expr}")
+    inner = expr[1:-1].strip()
+    if not inner:
+        return []
+    return [item.strip() for item in inner.split(",") if item.strip()]
 
 
 def verify_compliance_file_content(text: str) -> None:
@@ -225,86 +219,42 @@ def verify_compliance_file_content(text: str) -> None:
     if clean_text.count("{") != clean_text.count("}"):
         raise RuntimeError("syntax error: curly bracket pair mismatch")
 
-    type_body = extract_array_body(clean_text, "kComplianceTypeInfos")
-    types = [t.strip() for t in type_body.split(",") if t.strip()]
-    for ty in types:
-        if ty not in type_list:
-            raise RuntimeError(f"invalid type name {ty}")
-
-    vti_rows = split_top_level_braced_rows(
-        extract_array_body(clean_text, "kVersionedTypeInfos")
-    )
-    for row in vti_rows:
-        parts = [p.strip() for p in row.rsplit(",", 1)]
-        if len(parts) != 2:
-            raise RuntimeError(f"invalid VersionedTypeInfo row: {row}")
-        parse_array_ref(parts[0], "kComplianceTypeInfos", len(types))
-        if not re.fullmatch(r"SpecificationVersion::V_\d+_\d+", parts[1]):
-            raise RuntimeError(f"invalid specification version {parts[1]}")
-
-    prof_modes = [
-        m.strip()
-        for m in extract_array_body(clean_text, "kProfileModes").split(",")
-        if m.strip()
-    ]
-    for mode in prof_modes:
-        if mode not in profile_list or not mode.startswith("Profile::"):
-            raise RuntimeError(f"invalid profile name {mode}")
-
-    ext_modes = [
-        m.strip()
-        for m in extract_array_body(clean_text, "kExtensionModes").split(",")
-        if m.strip()
-    ]
-    for mode in ext_modes:
-        if mode not in profile_list or not mode.startswith("Extension::"):
-            raise RuntimeError(f"invalid profile name {mode}")
-
-    def verify_info_array(
-        array_name: str, mode_array_name: str, mode_count: int
-    ) -> int:
-        rows = split_top_level_braced_rows(extract_array_body(clean_text, array_name))
-        for row in rows:
-            fields = split_top_level_comma(row)
-            if len(fields) not in (2, 3):
-                raise RuntimeError(f"invalid {array_name} row: {row}")
-            parse_array_ref(fields[0], mode_array_name, mode_count)
-            if fields[1] != "{}":
-                parse_array_ref(fields[1], "kVersionedTypeInfos", len(vti_rows))
-            if len(fields) == 3 and fields[2] not in cond_list:
-                raise RuntimeError(f"invalid condition name {fields[2]}")
-        return len(rows)
-
-    def verify_op_table(
-        table_name: str, info_array_name: str, info_count: int
-    ) -> None:
+    def verify_table(table_name: str, mode_prefix: str) -> None:
         rows = split_top_level_braced_rows(extract_array_body(clean_text, table_name))
         prev_op_name = None
         for row in rows:
             fields = split_top_level_comma(row)
-            if len(fields) != 2:
+            if len(fields) not in (3, 4, 5):
                 raise RuntimeError(f"invalid {table_name} row: {row}")
             op_match = re.fullmatch(r'"tosa\.([a-z0-9_]+)"', fields[0])
             if not op_match or op_match.group(1) not in op_list:
                 raise RuntimeError(f"invalid tosa operation name {fields[0]}")
             op_name = op_match.group(1)
-            if prev_op_name is not None and op_name <= prev_op_name:
+            if prev_op_name is not None and op_name < prev_op_name:
                 raise RuntimeError(f"unsorted operation table in {table_name}")
             prev_op_name = op_name
-            parse_array_ref(fields[1], info_array_name, info_count)
 
-    prof_info_count = verify_info_array(
-        "kProfileComplianceInfos", "kProfileModes", len(prof_modes)
-    )
-    ext_info_count = verify_info_array(
-        "kExtensionComplianceInfos", "kExtensionModes", len(ext_modes)
-    )
-    verify_op_table(
-        "kProfileComplianceTable", "kProfileComplianceInfos", prof_info_count
-    )
-    verify_op_table(
-        "kExtensionComplianceTable", "kExtensionComplianceInfos", ext_info_count
-    )
+            modes = parse_braced_list(fields[1])
+            if not modes:
+                raise RuntimeError(f"empty mode list in {table_name}: {row}")
+            for mode in modes:
+                if mode not in profile_list or not mode.startswith(mode_prefix):
+                    raise RuntimeError(f"invalid profile name {mode}")
+
+            types = parse_braced_list(fields[2])
+            for ty in types:
+                if ty not in type_list:
+                    raise RuntimeError(f"invalid type name {ty}")
+
+            if len(fields) >= 4:
+                if not re.fullmatch(r"SpecificationVersion::V_\d+_\d+", fields[3]):
+                    raise RuntimeError(f"invalid specification version {fields[3]}")
+            if len(fields) == 5:
+                if fields[4] not in cond_list:
+                    raise RuntimeError(f"invalid condition name {fields[4]}")
+
+    verify_table("kProfileComplianceTable", "Profile::")
+    verify_table("kExtensionComplianceTable", "Extension::")
 
 
 def split_top_level_comma(text: str) -> list[str]:
@@ -325,29 +275,11 @@ def split_top_level_comma(text: str) -> list[str]:
 
 def make_valid_sample() -> str:
     return """
-static constexpr TypeInfo kComplianceTypeInfos[] = {
-    i8T, i32T,
+static constexpr OpComplianceInfo<Profile> kProfileComplianceTable[] = {
+    {"tosa.add", {Profile::pro_int}, {i8T, i32T}, SpecificationVersion::V_1_0},
 };
-static constexpr VersionedTypeInfo kVersionedTypeInfos[] = {
-    {llvm::ArrayRef(&kComplianceTypeInfos[0], 2), SpecificationVersion::V_1_0},
-};
-static constexpr Profile kProfileModes[] = {
-    Profile::pro_int,
-};
-static constexpr Extension kExtensionModes[] = {
-    Extension::bf16, Extension::fp8e4m3fn,
-};
-static constexpr OpComplianceInfo<Profile> kProfileComplianceInfos[] = {
-    {llvm::ArrayRef(&kProfileModes[0], 1), llvm::ArrayRef(&kVersionedTypeInfos[0], 1)},
-};
-static constexpr OpComplianceInfo<Extension> kExtensionComplianceInfos[] = {
-    {llvm::ArrayRef(&kExtensionModes[0], 2), {}, CheckCondition::allOf},
-};
-static constexpr OpComplianceEntry<Profile> kProfileComplianceTable[] = {
-    {"tosa.add", llvm::ArrayRef(&kProfileComplianceInfos[0], 1)},
-};
-static constexpr OpComplianceEntry<Extension> kExtensionComplianceTable[] = {
-    {"tosa.dim", llvm::ArrayRef(&kExtensionComplianceInfos[0], 1)},
+static constexpr OpComplianceInfo<Extension> kExtensionComplianceTable[] = {
+    {"tosa.dim", {Extension::bf16, Extension::fp8e4m3fn}, {}, SpecificationVersion::V_1_0, CheckCondition::allOf},
 };
 """
 
@@ -395,18 +327,11 @@ def test_unknown_syntax():
 
 def test_unsorted_ops():
     sample = make_valid_sample().replace(
-        '{"tosa.add", llvm::ArrayRef(&kProfileComplianceInfos[0], 1)},',
-        '{"tosa.sub", llvm::ArrayRef(&kProfileComplianceInfos[0], 1)},\n'
-        '    {"tosa.add", llvm::ArrayRef(&kProfileComplianceInfos[0], 1)},',
+        '{"tosa.add", {Profile::pro_int}, {i8T, i32T}, SpecificationVersion::V_1_0},',
+        '{"tosa.sub", {Profile::pro_int}, {i8T, i32T}, SpecificationVersion::V_1_0},\n'
+        '    {"tosa.add", {Profile::pro_int}, {i8T, i32T}, SpecificationVersion::V_1_0},',
     )
     assert_raises(sample, "unsorted operation table")
-
-
-def test_out_of_bounds_slice():
-    sample = make_valid_sample().replace(
-        "&kComplianceTypeInfos[0], 2", "&kComplianceTypeInfos[0], 5"
-    )
-    assert_raises(sample, "out-of-bounds ArrayRef")
 
 
 def self_sanity_check() -> None:
@@ -418,7 +343,6 @@ def self_sanity_check() -> None:
     test_unknown_condition()
     test_unknown_syntax()
     test_unsorted_ops()
-    test_out_of_bounds_slice()
 
 
 if __name__ == "__main__":
